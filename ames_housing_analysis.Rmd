@@ -1,0 +1,300 @@
+---
+title: "Projekt Zaliczeniowy - Statystyka w Sztucznej Inteligencji"
+author: "Michał Kowalczyk"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(earth)
+library(ranger)
+library(mgcv)
+library(vip)
+library(pdp)
+library(janitor)
+library(pROC)
+```
+
+## Wstęp i Przygotowanie Danych
+
+Wykorzystujemy znany zbiór danych Ames Housing. W celu ułatwienia modelowania wybieramy podzbiór około 20 najważniejszych predyktorów (zarówno numerycznych, jak i kategorycznych) oraz usuwamy brakujące wartości.
+
+```{r}
+# Wczytanie danych z wyłączeniem automatycznej konwersji nazw (check.names = FALSE)
+df <- read.csv("data/AmesHousing.csv", check.names = FALSE)
+
+# Ręczne, bezpieczne mapowanie dokładnie tych kolumn, które podałeś:
+df_selected <- df %>%
+  select(
+    sale_price = `SalePrice`,
+    lot_area = `Lot Area`,
+    overall_qual = `Overall Qual`,
+    overall_cond = `Overall Cond`,
+    year_built = `Year Built`,
+    year_remod_add = `Year Remod/Add`,
+    mas_vnr_area = `Mas Vnr Area`,
+    total_bsmt_sf = `Total Bsmt SF`,
+    first_flr_sf = `1st Flr SF`,
+    second_flr_sf = `2nd Flr SF`,
+    gr_liv_area = `Gr Liv Area`,
+    full_bath = `Full Bath`,
+    half_bath = `Half Bath`,
+    bedroom_abv_gr = `Bedroom AbvGr`,
+    tot_rms_abv_grd = `TotRms AbvGrd`,
+    fireplaces = `Fireplaces`,
+    garage_cars = `Garage Cars`,
+    garage_area = `Garage Area`,
+    neighborhood = `Neighborhood`,
+    bldg_type = `Bldg Type`,
+    house_style = `House Style`
+  ) %>%
+  drop_na() %>% # Proste usunięcie braków dla ułatwienia
+  mutate(
+    # Zmienna do klasyfikacji: 1 (Premium) jeśli cena > 250k, 0 w przeciwnym razie
+    is_premium = factor(ifelse(sale_price > 250000, "Yes", "No"), levels = c("No", "Yes")),
+    neighborhood = as.factor(neighborhood),
+    bldg_type = as.factor(bldg_type),
+    house_style = as.factor(house_style)
+  )
+
+# Podział na zbiór treningowy (70%) i testowy (30%)
+set.seed(123)
+train_idx <- createDataPartition(df_selected$sale_price, p = 0.7, list = FALSE)
+
+train_data <- df_selected[train_idx, ]
+test_data <- df_selected[-train_idx, ]
+
+# Zbiory dla problemów (usunięcie zbędnych targetów z predyktorów)
+train_reg <- train_data %>% select(-is_premium)
+test_reg <- test_data %>% select(-is_premium)
+
+train_class <- train_data %>% select(-sale_price)
+test_class <- test_data %>% select(-sale_price)
+```
+
+## Problem 1: Regresja
+
+W tym rozdziale przewidujemy ciągłą zmienną sale_price. Jako miarę błędu predykcji na zbiorze testowym wykorzystamy RMSE (Root Mean Squared Error) oraz MAE.
+
+### 1.1 Model Liniowy z selekcją predyktorów
+
+
+```{r}
+lm_full <- lm(sale_price ~ ., data = train_reg)
+lm_step <- step(lm_full, direction = "both", trace = 0)
+summary(lm_step)
+
+pred_lm <- predict(lm_step, test_reg)
+rmse_lm <- RMSE(pred_lm, test_reg$sale_price)
+```
+
+### 1.2 Zregularyzowany model liniowy
+
+```{r}
+x_train <- model.matrix(sale_price ~ ., train_reg)[, -1]
+y_train <- train_reg$sale_price
+x_test <- model.matrix(sale_price ~ ., test_reg)[, -1]
+
+set.seed(123)
+cv_glmnet <- cv.glmnet(x_train, y_train, alpha = 1) # alpha = 1 to Lasso
+pred_glmnet <- predict(cv_glmnet, s = "lambda.min", newx = x_test)
+rmse_glmnet <- RMSE(pred_glmnet, test_reg$sale_price)
+```
+
+### 1.3 Drzewo decyzyjne
+
+```{r}
+set.seed(123)
+tree_reg <- rpart(sale_price ~ ., data = train_reg, method = "anova")
+rpart.plot(tree_reg, main = "Drzewo Regresyjne")
+
+pred_tree <- predict(tree_reg, test_reg)
+rmse_tree <- RMSE(pred_tree, test_reg$sale_price)
+```
+
+### 1.4 MARS
+
+```{r}
+set.seed(123)
+mars_reg <- earth(sale_price ~ ., data = train_reg)
+summary(mars_reg)
+
+pred_mars <- predict(mars_reg, test_reg)
+rmse_mars <- RMSE(pred_mars, test_reg$sale_price)
+```
+
+### Las Losowy
+
+```{r}
+set.seed(123)
+rf_reg <- ranger(sale_price ~ ., data = train_reg, importance = "permutation")
+
+pred_rf <- predict(rf_reg, test_reg)$predictions
+rmse_rf <- RMSE(pred_rf, test_reg$sale_price)
+```
+
+### 1.6 Oceny istotności i wpływu predyktorów
+
+```{r}
+vip(rf_reg, num_features = 10, geom = "col") + 
+  theme_minimal() + 
+  ggtitle("Ważność zmiennych - Random Forest")
+```
+
+Widzimy, że overall_qual (Ogólna jakość) i gr_liv_area (Powierzchnia mieszkalna) są najważniejsze.
+Aby ocenić charakter wpływu, wygenerujemy Partial Dependence Plot dla gr_liv_area oraz year_built, by sprawdzić nieliniowość.
+
+```{r}
+# Wymaga modelu z pakietu randomForest do łatwego działania z pdp, zbudujmy go na szybko dla wyjaśnień
+rf_pdp_model <- randomForest::randomForest(sale_price ~ ., data = train_reg, ntree = 100)
+
+p1 <- partial(rf_pdp_model, pred.var = "gr_liv_area", plot = TRUE, plot.engine = "ggplot2") + ggtitle("Wpływ: Gr Liv Area")
+p2 <- partial(rf_pdp_model, pred.var = "year_built", plot = TRUE, plot.engine = "ggplot2") + ggtitle("Wpływ: Year Built")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+### 1.7 GAM
+
+```{r}
+gam_reg <- gam(sale_price ~ s(gr_liv_area) + s(year_built) + s(total_bsmt_sf) + 
+                 overall_qual + garage_cars + full_bath, 
+               data = train_reg, method = "REML")
+summary(gam_reg)
+
+# Wykresy komponentów wygładzających
+plot(gam_reg, pages = 1, scheme = 2, col = "blue")
+
+pred_gam <- predict(gam_reg, test_reg)
+rmse_gam <- RMSE(pred_gam, test_reg$sale_price)
+```
+
+### 1.8 Podsumowanie Błędu Testowego
+
+```{r}
+results_reg <- data.frame(
+  Model = c("Linear (Step)", "Lasso", "Decision Tree", "MARS", "Random Forest", "GAM"),
+  RMSE = c(rmse_lm, rmse_glmnet, rmse_tree, rmse_mars, rmse_rf, rmse_gam)
+)
+results_reg %>% arrange(RMSE) %>% knitr::kable(caption = "Błąd testowy RMSE dla problemu regresji")
+```
+
+
+## Problem 2: Klasyfikacja
+
+### 2.1 Model GLM
+
+```{r}
+glm_full <- glm(is_premium ~ ., data = train_class, family = binomial)
+glm_step <- step(glm_full, direction = "both", trace = 0)
+
+pred_glm_prob <- predict(glm_step, test_class, type = "response")
+auc_glm <- roc(test_class$is_premium, pred_glm_prob, quiet = TRUE)$auc
+```
+
+### 2.2 Zregularyzowany model GLM
+
+```{r}
+x_train_c <- model.matrix(is_premium ~ ., train_class)[, -1]
+y_train_c <- ifelse(train_class$is_premium == "Yes", 1, 0)
+x_test_c <- model.matrix(is_premium ~ ., test_class)[, -1]
+
+set.seed(123)
+cv_glmnet_c <- cv.glmnet(x_train_c, y_train_c, family = "binomial", alpha = 1)
+pred_glmnet_prob <- predict(cv_glmnet_c, s = "lambda.min", newx = x_test_c, type = "response")
+auc_glmnet <- roc(test_class$is_premium, as.numeric(pred_glmnet_prob), quiet = TRUE)$auc
+```
+
+### 2.3 Drzewo klasyfikacyjne
+
+```{r}
+set.seed(123)
+tree_class <- rpart(is_premium ~ ., data = train_class, method = "class")
+pred_tree_prob <- predict(tree_class, test_class, type = "prob")[, "Yes"]
+auc_tree <- roc(test_class$is_premium, pred_tree_prob, quiet = TRUE)$auc
+```
+
+
+### 2.4 MARS dla klasyfikacji
+
+```{r}
+set.seed(123)
+mars_class <- earth(is_premium ~ ., data = train_class, glm = list(family = binomial))
+pred_mars_prob <- predict(mars_class, test_class, type = "response")
+auc_mars <- roc(test_class$is_premium, as.numeric(pred_mars_prob), quiet = TRUE)$auc
+```
+
+### 2.5 Las Losowy
+
+```{r}
+set.seed(123)
+rf_class <- ranger(is_premium ~ ., data = train_class, probability = TRUE, importance = "permutation")
+pred_rf_prob <- predict(rf_class, test_class)$predictions[, "Yes"]
+auc_rf <- roc(test_class$is_premium, pred_rf_prob, quiet = TRUE)$auc
+```
+
+### 2.6 Ważność zmiennych
+
+```{r}
+vip(rf_class, num_features = 10, geom = "col") + 
+  theme_minimal() + 
+  ggtitle("Ważność zmiennych - Random Forest (Klasyfikacja)")
+```
+
+### 2.7 Uogólniony Model Addytywny
+
+```{r}
+gam_class <- gam(as.numeric(is_premium == "Yes") ~ s(gr_liv_area) + s(year_built) + s(total_bsmt_sf) + 
+                 overall_qual + garage_cars, 
+               data = train_class, family = binomial, method = "REML")
+
+pred_gam_prob <- predict(gam_class, test_class, type = "response")
+auc_gam <- roc(test_class$is_premium, as.numeric(pred_gam_prob), quiet = TRUE)$auc
+```
+
+### 2.8 Podsumowanie Błędu Testowego
+
+```{r}
+results_class <- data.frame(
+  Model = c("Logit (Step)", "Lasso Logit", "Decision Tree", "MARS", "Random Forest", "GAM"),
+  AUC = c(auc_glm, auc_glmnet, auc_tree, auc_mars, auc_rf, auc_gam)
+)
+results_class %>% arrange(desc(AUC)) %>% knitr::kable(caption = "Jakość modeli (AUC) dla problemu klasyfikacji")
+```
+
+## Wnioski
+
+Przeprowadzona analiza zbioru danych Ames Housing za pomocą różnorodnych metod uczenia maszynowego pozwala na sformułowanie kilku wniosków.
+
+**1. Przewaga modeli nieliniowych i zespołowych**
+W obu analizowanych problemach zauważalna jest przewaga modeli potrafiących modelować złożone, nieliniowe zależności. Z reguły **Random Forest** oraz **GAM** osiągają najlepsze wyniki (odpowiednio najniższy błąd RMSE w regresji oraz najwyższe AUC w klasyfikacji). Standardowe modele liniowe (Stepwise LM / Regresja Logistyczna) stanowią solidny punkt odniesienia, jednak ustępują modelom elastycznym. Pokazuje to, że rynek nieruchomości rządzi się prawami, których nie da się opisać prostymi, idealnie proporcjonalnymi równaniami. Zwykłe drzewo decyzyjne (CART) radzi sobie najsłabiej, co jest typowym zjawiskiem ze względu na jego tendencję do nadmiernego upraszczania problemu (tworzenie "schodkowych" predykcji).
+
+**2. Kluczowe predyktory i ich fizyczny sens**
+Wykresy ważności zmiennych (VIP) jednoznacznie wskazują, że najważniejszymi czynnikami decydującymi o cenie domu są:
+* `overall_qual` (Ogólna ocena materiałów i wykończenia),
+* `gr_liv_area` (Całkowita powierzchnia mieszkalna naziemna).
+
+Jest to w pełni zgodne z rynkową logiką – kupujący płacą przede wszystkim za metraż oraz wysoki standard wykończenia. Istotną rolę odgrywają również rok budowy (`year_built`) oraz wielkość garażu (`garage_cars`).
+
+**3. Zrozumienie nieliniowości**
+Dzięki wykresom Partial Dependence Plots (PDP) oraz funkcjom wygładzającym (`s()`) w modelu GAM, udało się uchwycić rzeczywisty charakter wpływu kluczowych zmiennych:
+* **Powierzchnia (`gr_liv_area`):** Wzrost metrażu drastycznie podnosi cenę, jednak po przekroczeniu pewnego progu (tzw. rezydencje o bardzo dużej powierzchni) przyrost ceny zaczyna hamować (efekt malejących zysków krańcowych). 
+* **Wiek budynku (`year_built`):** Relacja nie jest ściśle liniowa. Nowo wybudowane domy zyskują na wartości najszybciej (gwałtowny wzrost na końcu krzywej), podczas gdy różnice w cenie między domami z lat 50. a 70. są często marginalne i zależą bardziej od faktu przeprowadzenia renowacji.
+
+**4. Skuteczność klasyfikacji**
+Problem przypisania domu do kategorii "Premium" (powyżej 250 000 $) okazał się zadaniem, z którym algorytmy radzą sobie bardzo dobrze (wysokie wartości AUC bliskie 1). Wynika to z faktu, że domy z tego segmentu wyraźnie odcinają się od reszty rynku pod kątem jakości (`overall_qual` zazwyczaj 8 lub wyżej) i metrażu. Nawet prostsze zregularyzowane modele (Lasso) są w stanie skutecznie wyłapać te sygnały, choć MARS i Las Losowy radzą sobie najlepiej na pograniczu decyzyjnym (np. mały dom, ale z materiałów najwyższej jakości).
+
+**Podsumowanie końcowe:** Analiza udowadnia, że zastosowanie zaawansowanych metod statystycznych, takich jak MARS czy GAM, pozwala nie tylko na osiągnięcie wysokiej precyzji, ale również na interpretację skomplikowanych mechanizmów rynkowych, dając znacznie głębszy wgląd niż klasyczna regresja liniowa.
+
