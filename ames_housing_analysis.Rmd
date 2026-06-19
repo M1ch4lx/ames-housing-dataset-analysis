@@ -147,10 +147,23 @@ rmse_rf <- RMSE(pred_rf, test_reg$sale_price)
 
 ### 1.6 Oceny istotności i wpływu predyktorów
 
-```{r}
-vip(rf_reg, num_features = 10, geom = "col") + 
+```{r istotnosc_predyktorow_porownanie, fig.width=12, fig.height=5}
+p_vip_lm <- vip(lm_step, num_features = 10, geom = "col", 
+                aesthetics = list(fill = "#3498db")) + 
   theme_minimal() + 
-  ggtitle("Ważność zmiennych - Random Forest")
+  ggtitle("Ważność: Model Liniowy (Step)")
+
+p_vip_lasso <- vip(cv_glmnet, num_features = 10, geom = "col", lambda = cv_glmnet$lambda.min,
+                   aesthetics = list(fill = "#e67e22")) + 
+  theme_minimal() + 
+  ggtitle("Ważność: Zregularyzowany (Lasso)")
+
+p_vip_rf <- vip(rf_reg, num_features = 10, geom = "col",
+                aesthetics = list(fill = "#2c3e50")) + 
+  theme_minimal() + 
+  ggtitle("Ważność: Random Forest")
+
+gridExtra::grid.arrange(p_vip_lm, p_vip_lasso, p_vip_rf, ncol = 3)
 ```
 
 Widzimy, że overall_qual (Ogólna jakość) i gr_liv_area (Powierzchnia mieszkalna) są najważniejsze.
@@ -174,7 +187,6 @@ gam_reg <- gam(sale_price ~ s(gr_liv_area) + s(year_built) + s(total_bsmt_sf) +
                data = train_reg, method = "REML")
 summary(gam_reg)
 
-# Wykresy komponentów wygładzających
 plot(gam_reg, pages = 1, scheme = 2, col = "blue")
 
 pred_gam <- predict(gam_reg, test_reg)
@@ -191,6 +203,67 @@ results_reg <- data.frame(
 results_reg %>% arrange(RMSE) %>% knitr::kable(caption = "Błąd testowy RMSE dla problemu regresji")
 ```
 
+```{r regresja_wykresy_wszystkie, fig.width=12, fig.height=14}
+all_preds <- data.frame(
+  Actual = rep(test_reg$sale_price, 6),
+  Predicted = c(pred_lm, as.numeric(pred_glmnet), pred_tree, pred_mars, pred_rf, pred_gam),
+  Model = factor(rep(c("Linear (Step)", "Lasso", "Decision Tree", "MARS", "Random Forest", "GAM"), 
+                     each = nrow(test_reg)),
+                 levels = c("Linear (Step)", "Lasso", "Decision Tree", "MARS", "Random Forest", "GAM"))
+)
+
+all_preds$Residuals <- all_preds$Actual - all_preds$Predicted
+
+p_all_obs_pred <- ggplot(all_preds, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.3, show.legend = FALSE) +
+  geom_abline(slope = 1, intercept = 0, color = "#e74c3c", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ Model, scales = "fixed") +
+  scale_x_continuous(labels = scales::label_dollar(suffix = " k$", prefix = "", scale = 1e-3)) +
+  scale_y_continuous(labels = scales::label_dollar(suffix = " k$", prefix = "", scale = 1e-3)) +
+  scale_color_brewer(palette = "Set2") +
+  theme_minimal(base_size = 11) +
+  theme(strip.background = element_rect(fill = "#f8f9fa", color = NA),
+        strip.text = element_text(face = "bold")) +
+  labs(
+    title = "A. Wartości Przewidywane vs Rzeczywiste - Porównanie Modeli",
+    subtitle = "Im punkty leżą bliżej czerwonej linii przerywanej, tym lepsze dopasowanie modelu",
+    x = "Cena Rzeczywista (w tys. $)",
+    y = "Cena Przewidywana (w tys. $)"
+  )
+
+p_all_residuals <- ggplot(all_preds, aes(x = Predicted, y = Residuals, color = Model)) +
+  geom_point(alpha = 0.3, show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "#2c3e50", linetype = "solid", linewidth = 0.8) +
+  facet_wrap(~ Model, scales = "fixed") +
+  scale_x_continuous(labels = scales::label_dollar(suffix = " k$", prefix = "", scale = 1e-3)) +
+  scale_y_continuous(labels = scales::label_dollar(suffix = " k$", prefix = "", scale = 1e-3)) +
+  scale_color_brewer(palette = "Set2") +
+  theme_minimal(base_size = 11) +
+  theme(strip.background = element_rect(fill = "#f8f9fa", color = NA),
+        strip.text = element_text(face = "bold")) +
+  labs(
+    title = "B. Wykresy Reszt (Residual Plots) - Porównanie Modeli",
+    subtitle = "Idealny model posiada punkty rozłożone symetrycznie i losowo wokół linii Y = 0",
+    x = "Przewidywana Cena (w tys. $)",
+    y = "Błąd Predykcji / Reszta (w tys. $)"
+  )
+
+p_rmse_compare <- ggplot(results_reg, aes(x = reorder(Model, RMSE), y = RMSE, fill = Model)) +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  geom_text(aes(label = paste(round(RMSE, 0), "$")), vjust = -0.5, fontface = "bold", size = 3.5) +
+  scale_fill_brewer(palette = "Set2") + 
+  scale_y_continuous(labels = scales::label_dollar(suffix = " $", prefix = "")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "C. Końcowe podsumowanie błędu testowego RMSE",
+    subtitle = "Niższy słupek oznacza mniejszy błąd średni i wyższą precyzję modelu",
+    x = "Model",
+    y = "Błąd RMSE"
+  )
+
+gridExtra::grid.arrange(p_all_obs_pred, p_all_residuals, p_rmse_compare, 
+                        ncol = 1, heights = c(1.8, 1.8, 1))
+```
 
 ## Problem 2: Klasyfikacja
 
@@ -243,14 +316,36 @@ set.seed(123)
 rf_class <- ranger(is_premium ~ ., data = train_class, probability = TRUE, importance = "permutation")
 pred_rf_prob <- predict(rf_class, test_class)$predictions[, "Yes"]
 auc_rf <- roc(test_class$is_premium, pred_rf_prob, quiet = TRUE)$auc
+
+roc_rf <- roc(test_class$is_premium, pred_rf_prob, quiet = TRUE)
+
+plot(roc_rf, 
+     main = "Krzywa ROC - Random Forest",
+     col = "#2c3e50", 
+     lwd = 3,              
+     legacy.axes = TRUE, 
+     print.auc = TRUE)
 ```
 
 ### 2.6 Ważność zmiennych
 
-```{r}
-vip(rf_class, num_features = 10, geom = "col") + 
+```{r istotnosc_predyktorow_klasyfikacja_porownanie, fig.width=12, fig.height=5}
+p_vip_glm_c <- vip(glm_step, num_features = 10, geom = "col", 
+                  aesthetics = list(fill = "#3498db")) + 
   theme_minimal() + 
-  ggtitle("Ważność zmiennych - Random Forest (Klasyfikacja)")
+  ggtitle("Ważność: Logit (Step)")
+
+p_vip_lasso_c <- vip(cv_glmnet_c, num_features = 10, geom = "col", lambda = cv_glmnet_c$lambda.min,
+                     aesthetics = list(fill = "#e67e22")) + 
+  theme_minimal() + 
+  ggtitle("Ważność: Lasso Logit")
+
+p_vip_rf_c <- vip(rf_class, num_features = 10, geom = "col",
+                  aesthetics = list(fill = "#2c3e50")) + 
+  theme_minimal() + 
+  ggtitle("Ważność: Random Forest (Klasyfikacja)")
+
+gridExtra::grid.arrange(p_vip_glm_c, p_vip_lasso_c, p_vip_rf_c, ncol = 3)
 ```
 
 ### 2.7 Uogólniony Model Addytywny
@@ -274,12 +369,30 @@ results_class <- data.frame(
 results_class %>% arrange(desc(AUC)) %>% knitr::kable(caption = "Jakość modeli (AUC) dla problemu klasyfikacji")
 ```
 
+```{r}
+roc_glm    <- roc(test_class$is_premium, pred_glm_prob, quiet = TRUE)
+roc_glmnet <- roc(test_class$is_premium, as.numeric(pred_glmnet_prob), quiet = TRUE)
+roc_tree   <- roc(test_class$is_premium, pred_tree_prob, quiet = TRUE)
+roc_mars   <- roc(test_class$is_premium, as.numeric(pred_mars_prob), quiet = TRUE)
+roc_gam    <- roc(test_class$is_premium, as.numeric(pred_gam_prob), quiet = TRUE)
+
+plot(roc_glm, col = "red", lwd = 2, legacy.axes = TRUE, main = "Porównanie krzywych ROC dla wszystkich modeli")
+
+plot(roc_glmnet, col = "blue", lwd = 2, add = TRUE)
+plot(roc_tree, col = "darkgreen", lwd = 2, add = TRUE)
+plot(roc_mars, col = "orange", lwd = 2, add = TRUE)
+plot(roc_rf, col = "#2c3e50", lwd = 3, add = TRUE)
+plot(roc_gam, col = "purple", lwd = 2, add = TRUE)
+
+legend("bottomright", 
+       legend = c("Logit (Step)", "Lasso Logit", "Decision Tree", "MARS", "Random Forest", "GAM"),
+       col = c("red", "blue", "darkgreen", "orange", "#2c3e50", "purple"), 
+       lwd = 2)
+```
+
 ## Wnioski
 
-Przeprowadzona analiza zbioru danych Ames Housing za pomocą różnorodnych metod uczenia maszynowego pozwala na sformułowanie kilku wniosków.
-
-**1. Przewaga modeli nieliniowych i zespołowych**
-W obu analizowanych problemach zauważalna jest przewaga modeli potrafiących modelować złożone, nieliniowe zależności. Z reguły **Random Forest** oraz **GAM** osiągają najlepsze wyniki (odpowiednio najniższy błąd RMSE w regresji oraz najwyższe AUC w klasyfikacji). Standardowe modele liniowe (Stepwise LM / Regresja Logistyczna) stanowią solidny punkt odniesienia, jednak ustępują modelom elastycznym. Pokazuje to, że rynek nieruchomości rządzi się prawami, których nie da się opisać prostymi, idealnie proporcjonalnymi równaniami. Zwykłe drzewo decyzyjne (CART) radzi sobie najsłabiej, co jest typowym zjawiskiem ze względu na jego tendencję do nadmiernego upraszczania problemu (tworzenie "schodkowych" predykcji).
+W obu analizowanych problemach zauważalna jest przewaga modeli potrafiących modelować złożone, nieliniowe zależności. Z reguły **Random Forest** oraz **GAM** osiągają najlepsze wyniki. Standardowe modele liniowe. Zwykłe drzewo decyzyjne (CART) radzi sobie najsłabiej.
 
 **2. Kluczowe predyktory i ich fizyczny sens**
 Wykresy ważności zmiennych (VIP) jednoznacznie wskazują, że najważniejszymi czynnikami decydującymi o cenie domu są:
@@ -288,13 +401,8 @@ Wykresy ważności zmiennych (VIP) jednoznacznie wskazują, że najważniejszymi
 
 Jest to w pełni zgodne z rynkową logiką – kupujący płacą przede wszystkim za metraż oraz wysoki standard wykończenia. Istotną rolę odgrywają również rok budowy (`year_built`) oraz wielkość garażu (`garage_cars`).
 
-**3. Zrozumienie nieliniowości**
-Dzięki wykresom Partial Dependence Plots (PDP) oraz funkcjom wygładzającym (`s()`) w modelu GAM, udało się uchwycić rzeczywisty charakter wpływu kluczowych zmiennych:
+Dzięki wykresom Partial Dependence Plots (PDP) oraz funkcjom wygładzającym w modelu GAM, przeanalizowano wpływu kluczowych zmiennych:
 * **Powierzchnia (`gr_liv_area`):** Wzrost metrażu drastycznie podnosi cenę, jednak po przekroczeniu pewnego progu (tzw. rezydencje o bardzo dużej powierzchni) przyrost ceny zaczyna hamować (efekt malejących zysków krańcowych). 
 * **Wiek budynku (`year_built`):** Relacja nie jest ściśle liniowa. Nowo wybudowane domy zyskują na wartości najszybciej (gwałtowny wzrost na końcu krzywej), podczas gdy różnice w cenie między domami z lat 50. a 70. są często marginalne i zależą bardziej od faktu przeprowadzenia renowacji.
 
-**4. Skuteczność klasyfikacji**
-Problem przypisania domu do kategorii "Premium" (powyżej 250 000 $) okazał się zadaniem, z którym algorytmy radzą sobie bardzo dobrze (wysokie wartości AUC bliskie 1). Wynika to z faktu, że domy z tego segmentu wyraźnie odcinają się od reszty rynku pod kątem jakości (`overall_qual` zazwyczaj 8 lub wyżej) i metrażu. Nawet prostsze zregularyzowane modele (Lasso) są w stanie skutecznie wyłapać te sygnały, choć MARS i Las Losowy radzą sobie najlepiej na pograniczu decyzyjnym (np. mały dom, ale z materiałów najwyższej jakości).
-
-**Podsumowanie końcowe:** Analiza udowadnia, że zastosowanie zaawansowanych metod statystycznych, takich jak MARS czy GAM, pozwala nie tylko na osiągnięcie wysokiej precyzji, ale również na interpretację skomplikowanych mechanizmów rynkowych, dając znacznie głębszy wgląd niż klasyczna regresja liniowa.
-
+Problem przypisania domu do kategorii "Premium" (powyżej 250 000 $) okazał się zadaniem, z którym algorytmy radzą sobie bardzo dobrze (wysokie wartości AUC bliskie 1). Wynika to z faktu, że domy z tego segmentu wyraźnie odcinają się od reszty rynku pod kątem jakości (`overall_qual` zazwyczaj 8 lub wyżej) i metrażu.
